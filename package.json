@@ -1,0 +1,44 @@
+{
+  "name": "robinhood-trading-bot",
+  "version": "0.1.0",
+  "description": "Automated Robinhood Crypto trading bot: rule-based entries on new listings and new on-chain pair launches (holders, dev buy, liquidity, momentum), plus copy trading that mirrors tracked wallets. Web dashboard, CLI, optional Telegram alerts. Paper mode by default.",
+  "keywords": [
+    "robinhood",
+    "robinhood-crypto",
+    "trading-bot",
+    "copy-trading",
+    "copy-trader",
+    "crypto-bot",
+    "solana",
+    "pump-fun",
+    "new-pairs",
+    "sniper",
+    "algorithmic-trading",
+    "paper-trading"
+  ],
+  "license": "Apache-2.0",
+  "author": "nirholas (https://x.com/nichxbt)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nirholas/robinhood-trading-bot.git"
+  },
+  "homepage": "https://github.com/nirholas/robinhood-trading-bot#readme",
+  "bugs": {
+    "url": "https://github.com/nirholas/robinhood-trading-bot/issues"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "bin": {
+    "rhbot": "./bin/rhbot.js"
+  },
+  "main": "./src/bot.js",
+  "scripts": {
+    "start": "node bin/rhbot.js start",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "robinhood-mcp": "^0.1.1"
+  }
+}

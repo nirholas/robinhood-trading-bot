@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>robinhood-trading-bot</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #12161f; --panel2: #171c27; --line: #232a38;
+    --text: #e6e9f0; --dim: #8b93a5; --green: #2ee6a8; --red: #ff5d73;
+    --accent: #7aa2ff; --amber: #ffc46b; --mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.5 -apple-system, 'Segoe UI', Roboto, sans-serif; padding: 20px; }
+  a { color: var(--accent); }
+  h1 { font-size: 16px; font-family: var(--mono); letter-spacing: .5px; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1.2px; color: var(--dim); margin-bottom: 10px; font-family: var(--mono); }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; margin-bottom: 18px; }
+  .pill { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); border-radius: 999px; padding: 3px 12px; color: var(--dim); }
+  .pill b { color: var(--text); font-weight: 600; }
+  .pill.live b { color: var(--red); }
+  .pill.paper b { color: var(--green); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; min-width: 0; }
+  .panel.wide { grid-column: 1 / -1; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--dim); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .8px; padding: 4px 8px; }
+  td { padding: 6px 8px; border-top: 1px solid var(--line); font-family: var(--mono); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 220px; }
+  tr:hover td { background: var(--panel2); }
+  .pos { color: var(--green); } .neg { color: var(--red); } .dim { color: var(--dim); }
+  button { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 6px 14px; font: inherit; font-size: 13px; cursor: pointer; transition: border-color .15s, background .15s; }
+  button:hover { border-color: var(--accent); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button:active { transform: translateY(1px); }
+  button.danger { color: var(--red); }
+  button.primary { border-color: var(--accent); color: var(--accent); }
+  input, select, textarea { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 6px 10px; font: inherit; font-size: 13px; }
+  input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  textarea { width: 100%; min-height: 260px; font-family: var(--mono); font-size: 12px; resize: vertical; }
+  form.row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  form.row input { flex: 1; min-width: 120px; }
+  #feed { max-height: 420px; overflow-y: auto; font-family: var(--mono); font-size: 12px; display: flex; flex-direction: column-reverse; }
+  #feed div { padding: 3px 0; border-top: 1px solid var(--line); animation: fade .4s ease; word-break: break-all; white-space: normal; }
+  @keyframes fade { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; } }
+  .tag { display: inline-block; font-size: 10px; padding: 1px 7px; border-radius: 4px; margin-right: 7px; letter-spacing: .5px; }
+  .tag.trade { background: #103c2e; color: var(--green); }
+  .tag.signal { background: #1c2c52; color: var(--accent); }
+  .tag.warn { background: #4a3413; color: var(--amber); }
+  .tag.error { background: #4a1622; color: var(--red); }
+  .tag.info { background: var(--panel2); color: var(--dim); }
+  .empty { color: var(--dim); font-size: 13px; padding: 14px 4px; }
+  .msg { font-family: var(--mono); font-size: 12px; margin-top: 8px; min-height: 16px; }
+  .msg.err { color: var(--red); } .msg.ok { color: var(--green); }
+  @media (max-width: 700px) { body { padding: 10px; } .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>robinhood-trading-bot</h1>
+  <span class="pill" id="modePill">mode <b>...</b></span>
+  <span class="pill">cash <b id="cash">...</b></span>
+  <span class="pill">positions <b id="posValue">...</b></span>
+  <span class="pill">spent today <b id="spent">...</b></span>
+  <button id="pauseBtn" aria-label="Pause or resume trading">...</button>
+</header>
+
+<div class="grid">
+  <section class="panel wide">
+    <h2>Open positions</h2>
+    <div style="overflow-x:auto">
+      <table aria-label="Open positions">
+        <thead><tr><th>Symbol</th><th>Qty</th><th>Avg cost</th><th>Price</th><th>Value</th><th>PnL</th><th>Source</th><th></th></tr></thead>
+        <tbody id="positions"></tbody>
+      </table>
+    </div>
+    <div class="empty" id="positionsEmpty" hidden>No open positions. Entries appear here when a rule fires or a tracked wallet is mirrored.</div>
+  </section>
+
+  <section class="panel">
+    <h2>Tracked wallets (copy trading)</h2>
+    <table aria-label="Tracked wallets">
+      <thead><tr><th>Label</th><th>Address</th><th>On</th><th></th></tr></thead>
+      <tbody id="wallets"></tbody>
+    </table>
+    <div class="empty" id="walletsEmpty" hidden>No wallets tracked yet. Add a Solana address below; its swaps will be parsed and mirrored per your copy settings.</div>
+    <form class="row" id="walletForm">
+      <input id="wAddr" placeholder="Solana address" aria-label="Wallet address" required>
+      <input id="wLabel" placeholder="Label (optional)" aria-label="Wallet label" style="max-width:140px">
+      <button class="primary" type="submit">Track</button>
+    </form>
+    <div class="msg" id="walletMsg" role="status"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Manual order</h2>
+    <form class="row" id="tradeForm">
+      <input id="tSymbol" placeholder="SOL-USD" aria-label="Symbol" required style="max-width:110px">
+      <select id="tSide" aria-label="Side"><option value="buy">buy</option><option value="sell">sell</option></select>
+      <input id="tAmount" type="number" min="1" step="any" placeholder="USD" aria-label="Amount in USD" style="max-width:90px">
+      <button class="primary" type="submit">Place</button>
+    </form>
+    <div class="msg" id="tradeMsg" role="status"></div>
+    <h2 style="margin-top:18px">Recent trades</h2>
+    <div style="overflow-x:auto">
+      <table aria-label="Recent trades">
+        <thead><tr><th>Time</th><th>Side</th><th>Symbol</th><th>USD</th><th>Price</th><th>Src</th><th>Status</th></tr></thead>
+        <tbody id="trades"></tbody>
+      </table>
+    </div>
+    <div class="empty" id="tradesEmpty" hidden>No trades yet.</div>
+  </section>
+
+  <section class="panel wide">
+    <h2>Live feed <span class="dim" id="sseState">connecting</span></h2>
+    <div id="feed" aria-live="polite"></div>
+    <div class="empty" id="feedEmpty">Waiting for events: signals, trades, scanner activity, and errors stream here in real time.</div>
+  </section>
+
+  <section class="panel wide">
+    <h2>Configuration (rules, copy trading, risk, exits)</h2>
+    <textarea id="configBox" spellcheck="false" aria-label="Bot configuration JSON"></textarea>
+    <form class="row" onsubmit="return false">
+      <button class="primary" id="saveConfig">Save config</button>
+      <button id="reloadConfig">Reload</button>
+      <span class="msg" id="configMsg" role="status"></span>
+    </form>
+  </section>
+</div>
+
+<script>
+(() => {
+  const qs = new URLSearchParams(location.search);
+  if (qs.get('token')) { localStorage.setItem('rhbot_token', qs.get('token')); history.replaceState(null, '', '/'); }
+  const token = localStorage.getItem('rhbot_token') || prompt('Dashboard token (printed at bot startup):') || '';
+  localStorage.setItem('rhbot_token', token);
+  const headers = { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' };
+  const $ = (id) => document.getElementById(id);
+  const usd = (v) => v == null ? '?' : '$' + Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 });
+  const time = (ts) => new Date(ts).toLocaleTimeString();
+
+  async function api(path, body) {
+    const res = await fetch(path, body ? { method: 'POST', headers, body: JSON.stringify(body) } : { headers });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || res.status);
+    return data;
+  }
+
+  let paused = false;
+  async function refreshStatus() {
+    const s = await api('/api/status');
+    paused = s.paused;
+    const pill = $('modePill');
+    pill.innerHTML = 'mode <b>' + s.mode + (s.paused ? ' (paused)' : '') + '</b>';
+    pill.className = 'pill ' + s.mode;
+    $('cash').textContent = usd(s.paperCash) + (s.mode === 'paper' ? '' : ' (paper)');
+    $('posValue').textContent = usd(s.positionsValueUsd);
+    $('spent').textContent = usd(s.spentTodayUsd);
+    $('pauseBtn').textContent = s.paused ? 'Resume trading' : 'Pause trading';
+    $('pauseBtn').className = s.paused ? 'primary' : 'danger';
+
+    const posBody = $('positions');
+    posBody.innerHTML = '';
+    for (const p of s.positions) {
+      const pnl = p.pnlPct == null ? '' : (p.pnlPct >= 0 ? '+' : '') + p.pnlPct.toFixed(1) + '%';
+      const row = document.createElement('tr');
+      row.innerHTML = '<td>' + p.symbol + '</td><td>' + Number(p.qty).toPrecision(6) + '</td><td>' + usd(p.avg_cost) +
+        '</td><td>' + usd(p.price) + '</td><td>' + usd(p.valueUsd) +
+        '</td><td class="' + (p.pnlPct >= 0 ? 'pos' : 'neg') + '">' + pnl + '</td><td class="dim">' + p.source + '</td>' +
+        '<td><button data-close="' + p.symbol + '" class="danger" aria-label="Close position">close</button></td>';
+      posBody.appendChild(row);
+    }
+    $('positionsEmpty').hidden = s.positions.length > 0;
+
+    const wBody = $('wallets');
+    wBody.innerHTML = '';
+    for (const w of s.wallets) {
+      const row = document.createElement('tr');
+      row.innerHTML = '<td>' + (w.label || '<span class="dim">unnamed</span>') + '</td>' +
+        '<td title="' + w.address + '">' + w.address.slice(0, 4) + '..' + w.address.slice(-4) + '</td>' +
+        '<td><button data-toggle="' + w.address + '" data-on="' + w.enabled + '" aria-label="Toggle wallet">' + (w.enabled ? 'on' : 'off') + '</button></td>' +
+        '<td><button data-rm="' + w.address + '" class="danger" aria-label="Remove wallet">rm</button></td>';
+      wBody.appendChild(row);
+    }
+    $('walletsEmpty').hidden = s.wallets.length > 0;
+  }
+
+  async function refreshTrades() {
+    const { trades } = await api('/api/trades?limit=25');
+    const body = $('trades');
+    body.innerHTML = '';
+    for (const t of trades) {
+      const row = document.createElement('tr');
+      row.innerHTML = '<td class="dim">' + time(t.ts) + '</td><td class="' + (t.side === 'buy' ? 'pos' : 'neg') + '">' + t.side +
+        '</td><td>' + t.symbol + '</td><td>' + usd(t.quote_usd) + '</td><td>' + usd(t.price) +
+        '</td><td class="dim">' + t.source + '</td><td class="dim">' + t.status + '</td>';
+      body.appendChild(row);
+    }
+    $('tradesEmpty').hidden = trades.length > 0;
+  }
+
+  async function loadConfig() {
+    const config = await api('/api/config');
+    $('configBox').value = JSON.stringify(config, null, 2);
+  }
+
+  function feedLine(entry) {
+    $('feedEmpty').hidden = true;
+    const div = document.createElement('div');
+    const level = entry.level === 'trade' ? 'trade' : entry.level === 'signal' ? 'signal' : entry.level;
+    div.innerHTML = '<span class="tag ' + level + '">' + level + '</span><span class="dim">' + time(entry.ts) + '</span> ' +
+      escapeHtml(entry.message);
+    $('feed').appendChild(div);
+    while ($('feed').children.length > 300) $('feed').firstChild.remove();
+  }
+  function escapeHtml(s) { const d = document.createElement('span'); d.textContent = s; return d.innerHTML; }
+
+  function connectSse() {
+    const source = new EventSource('/api/events?token=' + encodeURIComponent(token));
+    source.onopen = () => { $('sseState').textContent = 'live'; };
+    source.onerror = () => { $('sseState').textContent = 'reconnecting'; };
+    source.onmessage = (event) => {
+      feedLine(JSON.parse(event.data));
+      refreshStatus().catch(() => {});
+      refreshTrades().catch(() => {});
+    };
+  }
+
+  // Wire controls -----------------------------------------------------------
+  $('pauseBtn').addEventListener('click', async () => {
+    await api('/api/pause', { paused: !paused });
+    refreshStatus();
+  });
+
+  $('walletForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const msg = $('walletMsg');
+    try {
+      await api('/api/wallets', { address: $('wAddr').value.trim(), label: $('wLabel').value.trim() });
+      msg.textContent = 'tracking'; msg.className = 'msg ok';
+      $('wAddr').value = ''; $('wLabel').value = '';
+      refreshStatus();
+    } catch (error) { msg.textContent = error.message; msg.className = 'msg err'; }
+  });
+
+  document.body.addEventListener('click', async (event) => {
+    const target = event.target;
+    if (target.dataset.rm) { await api('/api/wallets/remove', { address: target.dataset.rm }); refreshStatus(); }
+    if (target.dataset.toggle) {
+      await api('/api/wallets/toggle', { address: target.dataset.toggle, enabled: target.dataset.on !== '1' && target.dataset.on !== 'true' });
+      refreshStatus();
+    }
+    if (target.dataset.close) {
+      if (confirm('Close entire ' + target.dataset.close + ' position?')) {
+        await api('/api/trade', { symbol: target.dataset.close, side: 'sell', fraction: 1 }).catch((e) => alert(e.message));
+        refreshStatus(); refreshTrades();
+      }
+    }
+  });
+
+  $('tradeForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const msg = $('tradeMsg');
+    const side = $('tSide').value;
+    try {
+      const body = { symbol: $('tSymbol').value.trim().toUpperCase(), side };
+      if (side === 'buy') body.quoteUsd = Number($('tAmount').value);
+      else body.fraction = 1;
+      const result = await api('/api/trade', body);
+      msg.textContent = result.ok ? 'filled @ ' + usd(result.price) : (result.error || 'failed');
+      msg.className = 'msg ' + (result.ok ? 'ok' : 'err');
+      refreshStatus(); refreshTrades();
+    } catch (error) { msg.textContent = error.message; msg.className = 'msg err'; }
+  });
+
+  $('saveConfig').addEventListener('click', async () => {
+    const msg = $('configMsg');
+    try {
+      const parsed = JSON.parse($('configBox').value);
+      await api('/api/config', parsed);
+      msg.textContent = 'saved'; msg.className = 'msg ok';
+    } catch (error) { msg.textContent = error.message; msg.className = 'msg err'; }
+  });
+  $('reloadConfig').addEventListener('click', () => loadConfig());
+
+  // Boot --------------------------------------------------------------------
+  refreshStatus().catch((error) => { if (String(error.message) === 'unauthorized') { localStorage.removeItem('rhbot_token'); location.reload(); } });
+  refreshTrades().catch(() => {});
+  loadConfig().catch(() => {});
+  connectSse();
+  setInterval(() => { refreshStatus().catch(() => {}); }, 20000);
+})();
+</script>
+</body>
+</html>
