@@ -60,26 +60,45 @@ export const DEFAULT_CONFIG = {
   // Rule-based entries -------------------------------------------------------
   entryRules: [
     {
-      name: 'robinhood-new-listing',
-      enabled: false,
-      source: 'new_listing',
-      when: {},
-      action: { side: 'buy', quoteUsd: 25 },
-      note: 'Buy every brand-new Robinhood listing. Enable once you trust the sizing.',
-    },
-    {
-      name: 'fresh-pump-launch',
+      name: 'noxa-fresh-launch',
       enabled: false,
       source: 'new_pair',
       when: {
-        ageMinutes: { lte: 60 },
-        marketCapUsd: { gte: 15000 },
-        holdersTop10Pct: { lte: 40 },
-        devBuyPct: { lte: 6 },
-        tradeableOnRobinhood: { eq: true },
+        launchpad: { eq: 'noxa' },
+        ageMinutes: { lte: 30 },
+        liquidityUsd: { gte: 5000 },
+        top10Pct: { lte: 50 },
+        devHoldPct: { lte: 10 },
       },
       action: { side: 'buy', quoteUsd: 25 },
-      note: 'On-chain launch that graduated to a Robinhood-listed symbol with sane distribution.',
+      note: 'Instant-listed NOXA launch with real liquidity and sane distribution.',
+    },
+    {
+      name: 'odyssey-curve-momentum',
+      enabled: false,
+      source: 'new_pair',
+      when: {
+        launchpad: { eq: 'odyssey' },
+        event: { eq: 'launch' },
+        ageMinutes: { lte: 60 },
+        uniqueBuyers: { gte: 15 },
+        curveBuys: { gte: 20 },
+        devBuyUsd: { lte: 500 },
+      },
+      action: { side: 'buy', quoteUsd: 15 },
+      note: 'Bonding-curve launch with organic buyer flow and a modest dev buy. Paper-tradeable pre-graduation; live executes only once a pool exists.',
+    },
+    {
+      name: 'odyssey-graduation',
+      enabled: false,
+      source: 'new_pair',
+      when: {
+        event: { eq: 'graduation' },
+        holdersCount: { gte: 50 },
+        top10Pct: { lte: 45 },
+      },
+      action: { side: 'buy', quoteUsd: 25 },
+      note: 'Buy Odyssey tokens the moment they graduate to a Uniswap pool with a healthy holder base.',
     },
   ],
 
@@ -110,10 +129,8 @@ export const DEFAULT_CONFIG = {
 
   // Scanners -----------------------------------------------------------------
   scanners: {
-    newListingsSeconds: 60,
-    newPairsSeconds: 30,
-    newPairsSource: 'pumpfun',
-    quotesSeconds: 15,
+    newPairsSeconds: 20,
+    exitsSeconds: 15,
   },
 
   // Bot-level risk (paper and live; the execution layer adds its own caps) ---
@@ -162,7 +179,6 @@ export function envSettings() {
   return {
     mode: process.env.MODE === 'live' ? 'live' : 'paper',
     paperStartingUsd: positive(process.env.PAPER_STARTING_USD, 1000),
-    solanaRpcUrl: process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
     port: positive(process.env.PORT, 8788),
     host: process.env.HOST || '127.0.0.1',
     telegramToken: process.env.TELEGRAM_BOT_TOKEN || '',

@@ -101,7 +101,7 @@ export class Telegram {
           status.positions
             .map(
               (p) =>
-                `${p.symbol}: ${Number(p.qty).toPrecision(5)} @ $${p.avg_cost.toFixed(4)}` +
+                `${p.displaySymbol ?? p.symbol}: ${Number(p.qty).toPrecision(5)} @ $${p.avg_cost.toFixed(4)}` +
                 (p.pnlPct != null ? ` (${p.pnlPct >= 0 ? '+' : ''}${p.pnlPct.toFixed(1)}%)` : ''),
             )
             .join('\n'),

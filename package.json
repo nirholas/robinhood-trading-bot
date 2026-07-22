@@ -1,20 +1,22 @@
 {
   "name": "robinhood-trading-bot",
-  "version": "0.1.0",
-  "description": "Automated Robinhood Crypto trading bot: rule-based entries on new listings and new on-chain pair launches (holders, dev buy, liquidity, momentum), plus copy trading that mirrors tracked wallets. Web dashboard, CLI, optional Telegram alerts. Paper mode by default.",
+  "version": "0.2.0",
+  "description": "Automated trading bot for Robinhood Chain (chain ID 4663): rule-based entries on new launchpad pairs (NOXA + The Odyssey) with full on-chain data (holders, dev buy, liquidity, curve flow), plus copy trading that mirrors tracked wallets. Web dashboard, CLI, optional Telegram alerts. Paper mode by default.",
   "keywords": [
+    "robinhood-chain",
     "robinhood",
-    "robinhood-crypto",
     "trading-bot",
     "copy-trading",
     "copy-trader",
     "crypto-bot",
-    "solana",
-    "pump-fun",
+    "uniswap-v3",
+    "noxa",
+    "odyssey",
     "new-pairs",
     "sniper",
     "algorithmic-trading",
-    "paper-trading"
+    "paper-trading",
+    "hoodchain"
   ],
   "license": "Apache-2.0",
   "author": "nirholas (https://x.com/nichxbt)",
@@ -39,6 +41,7 @@
     "test": "node --test"
   },
   "dependencies": {
-    "robinhood-mcp": "^0.1.1"
+    "hoodchain": "^0.1.1",
+    "viem": "^2.21.0"
   }
 }

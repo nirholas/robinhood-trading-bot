@@ -12,7 +12,7 @@ const SCHEMA = `
 CREATE TABLE IF NOT EXISTS wallets (
   address       TEXT PRIMARY KEY,
   label         TEXT NOT NULL DEFAULT '',
-  chain         TEXT NOT NULL DEFAULT 'solana',
+  chain         TEXT NOT NULL DEFAULT 'robinhood-chain',
   enabled       INTEGER NOT NULL DEFAULT 1,
   added_at      INTEGER NOT NULL,
   last_sig      TEXT
@@ -114,7 +114,7 @@ export class Store {
 
   // -- wallets ---------------------------------------------------------------
 
-  addWallet(address, label = '', chain = 'solana') {
+  addWallet(address, label = '', chain = 'robinhood-chain') {
     this.db
       .prepare(
         `INSERT INTO wallets (address, label, chain, enabled, added_at) VALUES (?, ?, ?, 1, ?)

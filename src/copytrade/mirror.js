@@ -1,36 +1,25 @@
 /**
- * Copy-trade mirror: turns a tracked wallet's parsed swap into (1) a recorded
- * signal and (2), when the token maps to a Robinhood-listed symbol and copy
- * trading is enabled, a mirrored order sized by policy.
+ * Copy-trade mirror for Robinhood Chain: turns a tracked wallet's parsed swap
+ * into (1) a recorded signal and (2), when copy trading is enabled, a
+ * mirrored order sized by policy.
  *
- * Mint-to-symbol resolution is dynamic: a small static map covers the
- * heavily-traded Solana mints instantly, and everything else resolves through
- * DexScreener token metadata, then is checked against the live Robinhood
- * trading-pair catalog. Nothing is hardcoded to a curated list of coins.
+ * Everything on the chain is addressable directly: there is no symbol-mapping
+ * problem. The only execution constraint is live mode needing a Uniswap pool;
+ * bonding-curve tokens mirror in paper mode and are surfaced as signals in
+ * live mode until they graduate.
  */
 
-import { short } from './tracker.js';
-
-/** Well-known Solana mints for symbols Robinhood lists, resolved instantly. */
-const STATIC_MINT_SYMBOLS = new Map([
-  ['So11111111111111111111111111111111111111112', 'SOL'],
-  ['DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', 'BONK'],
-  ['EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm', 'WIF'],
-  ['2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv', 'PENGU'],
-  ['6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN', 'TRUMP'],
-]);
-
-const DEXSCREENER_TOKENS = 'https://api.dexscreener.com/latest/dex/tokens/';
-const SYMBOL_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+import { quoteSwap } from 'hoodchain';
+import { ADDRESSES, shortAddr } from '../chain/hood.js';
 
 export class Mirror {
   /**
    * @param {import('../log.js').Bus} bus
    * @param {import('../store.js').Store} store
-   * @param {import('../robinhood/market.js').Market} market
-   * @param {import('../robinhood/trader.js').Trader} trader
+   * @param {import('../chain/market.js').Market} market
+   * @param {import('../chain/trader.js').Trader} trader
    * @param {import('../risk.js').Risk} risk
-   * @param {() => object} getConfig live config accessor
+   * @param {() => object} getConfig
    */
   constructor(bus, store, market, trader, risk, getConfig) {
     this.bus = bus;
@@ -39,34 +28,28 @@ export class Mirror {
     this.trader = trader;
     this.risk = risk;
     this.getConfig = getConfig;
-    /** mint -> {symbol, at} */
-    this.symbolCache = new Map();
+    /** token -> {hasPool, at} */
+    this.poolCache = new Map();
   }
 
   /** Entry point wired into WalletTracker.onSwap. */
   async handleSwap(wallet, swap) {
     const config = this.getConfig().copy ?? {};
-    const solPrice = await this.solPriceUsd();
-    const notionalUsd = swapNotionalUsd(swap, solPrice);
-    const baseSymbol = await this.resolveSymbol(swap.mint);
-    const robinhoodSymbol = baseSymbol ? `${baseSymbol}-USD` : null;
-    const pairs = new Set(await this.market.tradingPairs().catch(() => []));
-    const tradeable = Boolean(robinhoodSymbol && pairs.has(robinhoodSymbol));
-    const label = wallet.label || short(wallet.address);
+    const label = wallet.label || shortAddr(wallet.address);
+    const display = `${swap.symbol} (${shortAddr(swap.token)})`;
 
     const signal = {
       source: 'copy',
-      wallet: wallet.address,
+      wallet: wallet.address.toLowerCase(),
       walletLabel: label,
       side: swap.side,
-      mint: swap.mint,
-      symbol: robinhoodSymbol ?? baseSymbol ?? swap.mint,
-      baseSymbol,
-      tradeableOnRobinhood: tradeable,
-      notionalUsd,
-      tokenDelta: swap.tokenDelta,
+      token: swap.token,
+      symbol: swap.symbol,
+      qty: swap.qty,
+      notionalUsd: swap.notionalUsd,
       fractionSold: swap.fractionSold,
-      signature: swap.signature,
+      via: swap.via,
+      txHash: swap.txHash,
     };
 
     let action = 'recorded';
@@ -74,55 +57,50 @@ export class Mirror {
 
     if (!config.enabled) {
       action = 'copy-disabled';
-    } else if (!tradeable) {
-      action = 'unmapped';
-      if (config.alertUnmapped) {
+    } else if (swap.side === 'buy') {
+      if (swap.notionalUsd !== null && swap.notionalUsd < (config.minTrackedNotionalUsd ?? 0)) {
+        action = 'below-min-notional';
+      } else if (this.trader.mode === 'live' && !(await this.hasPool(swap.token))) {
+        action = 'no-pool-live';
         this.bus.log(
           'signal',
-          'copy.unmapped',
-          `${label} ${swap.side} ${baseSymbol ?? short(swap.mint)} (~$${fmt(notionalUsd)}); not listed on Robinhood, signal only.`,
+          'copy.curve-only',
+          `${label} bought ${display} on the bonding curve (~$${fmt(swap.notionalUsd)}); no pool yet, signal only in live mode.`,
           signal,
         );
-      }
-    } else if (swap.side === 'buy') {
-      if (notionalUsd !== null && notionalUsd < (config.minTrackedNotionalUsd ?? 0)) {
-        action = 'below-min-notional';
       } else {
-        const quoteUsd = this.sizeBuy(config, notionalUsd);
-        const gate = this.risk.checkBuy(robinhoodSymbol, quoteUsd);
+        const quoteUsd = this.sizeBuy(config, swap.notionalUsd);
+        const gate = this.risk.checkBuy(swap.token, quoteUsd);
         if (!gate.ok) {
           action = `risk-blocked: ${gate.reason}`;
-          this.bus.warn('copy.blocked', `Copy buy ${robinhoodSymbol} blocked: ${gate.reason}`, signal);
+          this.bus.warn('copy.blocked', `Copy buy ${display} blocked: ${gate.reason}`, signal);
         } else {
           const result = await this.trader.place({
-            symbol: robinhoodSymbol,
+            token: swap.token,
             side: 'buy',
             quoteUsd,
             source: 'copy',
-            reason: `copy ${label} buy ~$${fmt(notionalUsd)} of ${baseSymbol}`,
+            reason: `copy ${label} buy ~$${fmt(swap.notionalUsd)} of ${swap.symbol}`,
           });
           executed = result.ok;
           action = result.ok ? `mirrored $${quoteUsd.toFixed(2)}` : `failed: ${result.error}`;
         }
       }
     } else {
-      // Sell: mirror only if we hold a position, selling the same fraction
-      // the tracked wallet sold.
       if (!config.mirrorSells) {
         action = 'sells-disabled';
       } else {
-        const position = this.store.getPosition(robinhoodSymbol);
+        const position = this.store.getPosition(swap.token);
         if (!position) {
           action = 'no-position';
         } else {
           const fraction = swap.fractionSold ?? 1;
-          const assetQty = position.qty * fraction;
           const result = await this.trader.place({
-            symbol: robinhoodSymbol,
+            token: swap.token,
             side: 'sell',
-            assetQty,
+            qty: position.qty * fraction,
             source: 'copy',
-            reason: `copy ${label} sold ${(fraction * 100).toFixed(0)}% of ${baseSymbol}`,
+            reason: `copy ${label} sold ${(fraction * 100).toFixed(0)}% of ${swap.symbol}`,
           });
           executed = result.ok;
           action = result.ok
@@ -134,8 +112,8 @@ export class Mirror {
 
     this.store.insertSignal({
       source: 'copy',
-      symbol: signal.symbol,
-      mint: swap.mint,
+      symbol: swap.symbol,
+      mint: swap.token,
       data: signal,
       action,
     });
@@ -143,7 +121,7 @@ export class Mirror {
       this.bus.log(
         'signal',
         'copy.swap',
-        `${label} ${swap.side} ${baseSymbol ?? short(swap.mint)} ~$${fmt(notionalUsd)} -> ${action}`,
+        `${label} ${swap.side} ${display} ~$${fmt(swap.notionalUsd)} -> ${action}`,
         { ...signal, action },
       );
     }
@@ -157,49 +135,26 @@ export class Mirror {
     return clamp(config.fixedUsd ?? 25, 1, config.maxUsd ?? 100);
   }
 
-  async resolveSymbol(mint) {
-    const staticSymbol = STATIC_MINT_SYMBOLS.get(mint);
-    if (staticSymbol) return staticSymbol;
-
-    const cached = this.symbolCache.get(mint);
-    if (cached && Date.now() - cached.at < SYMBOL_CACHE_TTL_MS) return cached.symbol;
-
-    let symbol = null;
+  /** Whether a Uniswap route exists for the token (60s cached). */
+  async hasPool(token) {
+    const key = token.toLowerCase();
+    const cached = this.poolCache.get(key);
+    if (cached && Date.now() - cached.at < 60_000) return cached.hasPool;
+    let hasPool = false;
     try {
-      const response = await fetch(`${DEXSCREENER_TOKENS}${mint}`, {
-        headers: { accept: 'application/json' },
-        signal: AbortSignal.timeout(10_000),
+      const meta = await this.market.metadata(token);
+      await quoteSwap(this.trader.client, {
+        tokenIn: ADDRESSES.weth,
+        tokenOut: token,
+        amountIn: 10n ** 15n, // 0.001 WETH probe
       });
-      if (response.ok) {
-        const data = await response.json();
-        const pair = (data?.pairs ?? []).find((entry) => entry?.baseToken?.address === mint);
-        const raw = pair?.baseToken?.symbol;
-        if (raw && /^[A-Za-z0-9]{2,12}$/.test(raw)) symbol = raw.toUpperCase();
-      }
+      hasPool = Boolean(meta);
     } catch {
-      // Unresolvable now; cache the miss briefly via null entry below.
+      hasPool = false;
     }
-    this.symbolCache.set(mint, { symbol, at: Date.now() });
-    return symbol;
+    this.poolCache.set(key, { hasPool, at: Date.now() });
+    return hasPool;
   }
-
-  async solPriceUsd() {
-    try {
-      const quotes = await this.market.quotes(['SOL-USD']);
-      return quotes.get('SOL-USD')?.mid ?? null;
-    } catch {
-      return null;
-    }
-  }
-}
-
-/** USD value of the quote side of a swap. Exported for tests. */
-export function swapNotionalUsd(swap, solPriceUsd) {
-  if (Math.abs(swap.usdcDelta) > 1e-6) return Math.abs(swap.usdcDelta);
-  if (solPriceUsd && Math.abs(swap.solDelta) > 1e-9) {
-    return Math.abs(swap.solDelta) * solPriceUsd;
-  }
-  return null;
 }
 
 function clamp(value, min, max) {

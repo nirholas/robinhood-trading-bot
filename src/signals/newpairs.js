@@ -1,262 +1,352 @@
 /**
- * New-pair scanner: watches on-chain token launches and turns each one into a
- * fully-enriched signal object the rule engine can filter on.
+ * New-pair scanner for Robinhood Chain's two launchpads:
  *
- * Sources, all keyless:
- *   - pump.fun frontend API: newest launches, creator, market cap, socials,
- *     bonding-curve state.
- *   - DexScreener: liquidity, volume, price change windows, price, FDV for
- *     anything that has a DEX pair (graduated launches).
- *   - Solana RPC: top-holder concentration (getTokenLargestAccounts) and the
- *     dev's current holding share (getTokenAccountsByOwner). With a Helius
- *     RPC configured, a true holder count via the DAS getTokenAccounts API.
+ *   - NOXA: instant Uniswap v3 listing (pool exists from block one).
+ *   - The Odyssey: pump.fun-style bonding curve across three factories; a
+ *     pool appears at graduation (PoolMigrated), which is also a signal.
  *
- * A launch that maps to a Robinhood-listed symbol is marked tradeable; the
- * bot can then execute the matched rule on Robinhood. Everything else is
- * still recorded and alerted so the feed doubles as a launch radar.
+ * Discovery reads Blockscout's per-address log API (newest-first, no block
+ * range to guess) rather than raw eth_getLogs: the chain's public RPC caps
+ * log queries silently, and the launchpads are low-frequency enough that the
+ * indexer is both fresher and cheaper. Raw topics + data are decoded locally
+ * with the SDK's own event ABIs, so no trust is placed in indexer decoding.
+ *
+ * Every launch becomes a fully-enriched signal for the rule engine:
+ * metadata, age, price, market cap, pool liquidity, holder count and
+ * concentration, the dev's current holding share, and for curve tokens the
+ * live order flow (buys, sells, unique buyers, volume, dev buy).
+ * Enrichment failures degrade to nulls; rules on missing fields fail closed.
  */
 
-const PUMP_BASE = process.env.PUMP_FRONTEND_BASE || 'https://frontend-api-v3.pump.fun';
-const DEXSCREENER_TOKENS = 'https://api.dexscreener.com/latest/dex/tokens/';
-const FETCH_TIMEOUT_MS = 12_000;
+import { decodeEventLog, encodeEventTopics } from 'viem';
+import {
+  noxaTokenLaunchedEvent,
+  odysseyTokenCreatedEvent,
+  odysseyTradedEvent,
+  odysseyPoolMigratedEvent,
+  NOXA_ADDRESSES,
+  ODYSSEY_ADDRESSES,
+  erc20Abi,
+} from 'hoodchain';
+import { ADDRESSES, BLOCKSCOUT_API, shortAddr } from '../chain/hood.js';
+
 const MAX_ENRICH_PER_SCAN = 8;
-const PUMP_TOTAL_SUPPLY = 1_000_000_000; // pump.fun standard supply, used as fallback
+const FETCH_TIMEOUT_MS = 12_000;
+/** Curve-stats log window after launch, chunked to stay under RPC caps. */
+const CURVE_WINDOW_BLOCKS = 30_000n;
+const CURVE_CHUNK_BLOCKS = 10_000n;
+
+const ODYSSEY_FACTORIES = [
+  ODYSSEY_ADDRESSES.bondingCurveFactory,
+  ODYSSEY_ADDRESSES.reflectionFactory,
+  ODYSSEY_ADDRESSES.instantFactory,
+];
+
+/** Every (factory, event) stream the scanner watches. */
+const SOURCES = [
+  { launchpad: 'noxa', kind: 'launch', address: NOXA_ADDRESSES.launchFactory, event: noxaTokenLaunchedEvent },
+  ...ODYSSEY_FACTORIES.map((address) => ({
+    launchpad: 'odyssey',
+    kind: 'launch',
+    address,
+    event: odysseyTokenCreatedEvent,
+  })),
+  ...ODYSSEY_FACTORIES.map((address) => ({
+    launchpad: 'odyssey',
+    kind: 'graduation',
+    address,
+    event: odysseyPoolMigratedEvent,
+  })),
+];
 
 export class NewPairScanner {
   /**
    * @param {import('../log.js').Bus} bus
    * @param {import('../store.js').Store} store
-   * @param {import('../robinhood/market.js').Market} market
-   * @param {string} rpcUrl
+   * @param {import('../chain/market.js').Market} market
+   * @param {import('hoodchain').HoodClient} client
    */
-  constructor(bus, store, market, rpcUrl) {
+  constructor(bus, store, market, client) {
     this.bus = bus;
     this.store = store;
     this.market = market;
-    this.rpcUrl = rpcUrl;
+    this.client = client;
   }
 
-  /**
-   * One scan pass. Returns enriched signals for launches not seen before.
-   */
+  /** One scan pass across every launchpad stream. */
   async scan() {
-    const coins = await this.fetchLatestCoins();
-    if (!coins.length) return [];
+    const cursorRaw = this.store.kvGet('chain_scan_cursor');
+    // Sequential on purpose: a parallel burst trips Blockscout rate limits
+    // and the failures would read as "no launches".
+    const events = [];
+    let failedStreams = 0;
+    for (const source of SOURCES) {
+      const stream = await this.fetchStream(source);
+      if (stream === null) failedStreams += 1;
+      else events.push(...stream);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    if (failedStreams) {
+      this.bus.warn('newpairs.stream', `${failedStreams}/${SOURCES.length} launchpad streams failed this pass.`);
+    }
+    const maxBlock = events.reduce((max, event) => (event.blockNumber > max ? event.blockNumber : max), 0n);
 
-    const lastSeen = Number(this.store.kvGet('pump_last_created') ?? 0);
-    const fresh = coins
-      .filter((coin) => Number(coin.created_timestamp) > lastSeen && !coin.nsfw)
-      .sort((a, b) => Number(a.created_timestamp) - Number(b.created_timestamp));
-
-    if (fresh.length) {
-      this.store.kvSet('pump_last_created', String(Number(fresh.at(-1).created_timestamp)));
+    if (cursorRaw === null) {
+      // First run seeds the cursor: day-zero history is noise, not signal.
+      this.store.kvSet('chain_scan_cursor', (maxBlock || 0n).toString());
+      this.bus.info('newpairs.seed', `Launch scanner armed. Watching ${SOURCES.length} launchpad streams.`);
+      return [];
     }
 
-    const toEnrich = fresh.slice(-MAX_ENRICH_PER_SCAN);
+    const cursor = BigInt(cursorRaw);
+    const fresh = events
+      .filter((event) => event.blockNumber > cursor)
+      .sort((a, b) => (a.blockNumber < b.blockNumber ? -1 : 1));
+    if (maxBlock > cursor) this.store.kvSet('chain_scan_cursor', maxBlock.toString());
+    if (!fresh.length) return [];
+
+    const toEnrich = fresh.slice(0, MAX_ENRICH_PER_SCAN);
     if (fresh.length > toEnrich.length) {
       this.bus.info(
         'newpairs.skip',
-        `${fresh.length - toEnrich.length} launches skipped this pass (enrichment cap ${MAX_ENRICH_PER_SCAN}).`,
+        `${fresh.length - toEnrich.length} launch events skipped this pass (enrichment cap ${MAX_ENRICH_PER_SCAN}).`,
       );
     }
 
-    const rhPairs = new Set(await this.market.tradingPairs().catch(() => []));
     const signals = [];
-    for (const coin of toEnrich) {
+    for (const event of toEnrich) {
       try {
-        signals.push(await this.enrich(coin, rhPairs));
+        signals.push(await this.enrich(event));
       } catch (error) {
-        this.bus.warn('newpairs.enrich', `Enrichment failed for ${coin.mint}: ${error.message}`);
+        this.bus.warn('newpairs.enrich', `Enrichment failed for ${shortAddr(event.token)}: ${error.message}`);
       }
     }
     return signals;
   }
 
-  async fetchLatestCoins() {
-    const url = `${PUMP_BASE}/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false`;
-    const data = await fetchJson(url);
-    if (!data) return [];
-    return Array.isArray(data) ? data : Array.isArray(data?.coins) ? data.coins : [];
+  /** Newest logs for one (factory, event) stream, decoded locally. Null on fetch failure. */
+  async fetchStream(source) {
+    const topic0 = encodeEventTopics({ abi: [source.event] })[0];
+    const data = await fetchJson(
+      `${BLOCKSCOUT_API}/addresses/${source.address}/logs?topic=${topic0}`,
+    );
+    if (data === null) return null;
+    const items = Array.isArray(data?.items) ? data.items : [];
+    const events = [];
+    for (const item of items) {
+      try {
+        const decoded = decodeEventLog({
+          abi: [source.event],
+          data: item.data ?? '0x',
+          topics: item.topics,
+        });
+        const args = decoded.args;
+        events.push({
+          kind: source.kind,
+          launchpad: source.launchpad,
+          token: String(args.token).toLowerCase(),
+          creator: args.deployer
+            ? String(args.deployer).toLowerCase()
+            : args.creator
+              ? String(args.creator).toLowerCase()
+              : null,
+          pool: args.pool ? String(args.pool).toLowerCase() : null,
+          blockNumber: BigInt(item.block_number ?? 0),
+          timestamp: item.block_timestamp ? Date.parse(item.block_timestamp) : null,
+          transactionHash: item.transaction_hash ?? item.tx_hash ?? null,
+        });
+      } catch {
+        // A log this ABI cannot decode is another event sharing the address.
+      }
+    }
+    return events;
   }
 
-  /** Build the full signal object for one launch. */
-  async enrich(coin, rhPairs) {
-    const mint = String(coin.mint);
-    const createdAt = Number(coin.created_timestamp) || Date.now();
-    const baseSymbol = String(coin.symbol || '').toUpperCase();
-    const robinhoodSymbol = `${baseSymbol}-USD`;
-    const tradeableOnRobinhood = rhPairs.has(robinhoodSymbol);
+  /** Build the full signal object for one launch or graduation event. */
+  async enrich(event) {
+    const token = event.token;
+    const [meta, ethUsd] = await Promise.all([
+      this.market.metadata(token),
+      this.market.ethUsd().catch(() => null),
+    ]);
+    let launchedAt = event.timestamp;
+    if (!launchedAt) {
+      const block = await this.client.public.getBlock({ blockNumber: event.blockNumber }).catch(() => null);
+      launchedAt = block ? Number(block.timestamp) * 1000 : Date.now();
+    }
+    const hasPool = Boolean(event.pool) || event.launchpad === 'noxa' || event.kind === 'graduation';
 
-    const [dex, holderStats] = await Promise.all([
-      this.dexScreener(mint),
-      this.holderStats(mint, String(coin.creator || '')),
+    const [curve, holderStats, devHoldPct, pool] = await Promise.all([
+      event.launchpad === 'odyssey' ? this.curveStats(token, event, ethUsd) : Promise.resolve(null),
+      this.holderStats(token, meta),
+      event.creator ? this.devHoldPct(token, event.creator, meta) : Promise.resolve(null),
+      event.pool ? this.poolStats(event.pool, ethUsd) : Promise.resolve(null),
     ]);
 
-    const marketCapUsd = pickNumber(coin.usd_market_cap, dex?.marketCap, dex?.fdv);
-    const signal = {
+    let priceUsd = await this.market.priceUsd(token);
+    if (!priceUsd && curve?.lastPriceUsd) {
+      this.market.recordCurvePrice(token, curve.lastPriceUsd);
+      priceUsd = curve.lastPriceUsd;
+    }
+    const supply = Number(meta.totalSupply) / 10 ** meta.decimals;
+    const marketCapUsd = priceUsd && supply ? priceUsd * supply : null;
+
+    return {
       source: 'new_pair',
-      mint,
-      symbol: tradeableOnRobinhood ? robinhoodSymbol : baseSymbol,
-      robinhoodSymbol: tradeableOnRobinhood ? robinhoodSymbol : null,
-      tradeableOnRobinhood,
-      name: String(coin.name || ''),
-      creator: String(coin.creator || ''),
-      createdAt,
-      ageMinutes: Math.max(0, (Date.now() - createdAt) / 60_000),
+      event: event.kind,
+      launchpad: event.launchpad,
+      token,
+      pool: event.pool,
+      symbol: meta.symbol,
+      name: meta.name,
+      creator: event.creator,
+      launchedAt,
+      ageMinutes: Math.max(0, (Date.now() - launchedAt) / 60_000),
 
-      // Valuation + market data
+      hasPool,
+      graduated: event.launchpad === 'noxa' ? true : hasPool,
+
+      priceUsd,
       marketCapUsd,
-      priceUsd: dex?.priceUsd ?? null,
-      liquidityUsd: dex?.liquidityUsd ?? null,
-      volume5mUsd: dex?.volume5mUsd ?? null,
-      volume1hUsd: dex?.volume1hUsd ?? null,
-      volume24hUsd: dex?.volume24hUsd ?? null,
-      priceChange5m: dex?.priceChange5m ?? null,
-      priceChange1h: dex?.priceChange1h ?? null,
-      priceChange24h: dex?.priceChange24h ?? null,
-      txns1h: dex?.txns1h ?? null,
-      buys1h: dex?.buys1h ?? null,
-      sells1h: dex?.sells1h ?? null,
+      liquidityUsd: pool?.liquidityUsd ?? null,
 
-      // Distribution
       holdersCount: holderStats.holdersCount,
       top10Pct: holderStats.top10Pct,
-      devHoldPct: holderStats.devHoldPct,
-      // Alias: most rule sets say "dev buy"; on a fresh launch the dev's
-      // holding IS the dev buy until they move it.
-      devBuyPct: holderStats.devHoldPct,
+      devHoldPct,
+      devBuyPct: devHoldPct,
+      devBuyEth: curve?.devBuyEth ?? null,
+      devBuyUsd: curve?.devBuyUsd ?? null,
 
-      // Launch state
-      graduated: Boolean(coin.complete),
-      bondingProgressPct: bondingProgress(coin),
-      replyCount: Number(coin.reply_count ?? 0),
-      hasTwitter: Boolean(coin.twitter),
-      hasTelegram: Boolean(coin.telegram),
-      hasWebsite: Boolean(coin.website),
-    };
-    return signal;
-  }
+      curveBuys: curve?.buys ?? null,
+      curveSells: curve?.sells ?? null,
+      uniqueBuyers: curve?.uniqueBuyers ?? null,
+      curveVolumeEth: curve?.volumeEth ?? null,
+      curveVolumeUsd: curve?.volumeUsd ?? null,
 
-  /** DexScreener market data for a mint; null when no DEX pair exists yet. */
-  async dexScreener(mint) {
-    const data = await fetchJson(`${DEXSCREENER_TOKENS}${mint}`);
-    const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
-    if (!pairs.length) return null;
-    // Deepest pair is the canonical market.
-    const pair = pairs.reduce((best, candidate) =>
-      Number(candidate?.liquidity?.usd ?? 0) > Number(best?.liquidity?.usd ?? 0) ? candidate : best,
-    );
-    return {
-      priceUsd: pickNumber(pair.priceUsd),
-      liquidityUsd: pickNumber(pair.liquidity?.usd),
-      volume5mUsd: pickNumber(pair.volume?.m5),
-      volume1hUsd: pickNumber(pair.volume?.h1),
-      volume24hUsd: pickNumber(pair.volume?.h24),
-      priceChange5m: pickNumber(pair.priceChange?.m5),
-      priceChange1h: pickNumber(pair.priceChange?.h1),
-      priceChange24h: pickNumber(pair.priceChange?.h24),
-      txns1h: sum(pair.txns?.h1?.buys, pair.txns?.h1?.sells),
-      buys1h: pickNumber(pair.txns?.h1?.buys),
-      sells1h: pickNumber(pair.txns?.h1?.sells),
-      marketCap: pickNumber(pair.marketCap),
-      fdv: pickNumber(pair.fdv),
+      transactionHash: event.transactionHash,
     };
   }
 
-  /**
-   * Holder concentration from chain state. Degrades gracefully: any RPC
-   * failure yields nulls rather than a failed signal, and rules that require
-   * these fields simply will not match (fail closed).
-   */
-  async holderStats(mint, creator) {
-    const out = { holdersCount: null, top10Pct: null, devHoldPct: null };
+  /** Aggregate bonding-curve order flow after launch (chunked, bounded). */
+  async curveStats(token, event, ethUsd) {
     try {
-      const [supplyRes, largestRes] = await Promise.all([
-        this.rpc('getTokenSupply', [mint]),
-        this.rpc('getTokenLargestAccounts', [mint]),
-      ]);
-      const supply = Number(supplyRes?.value?.uiAmount ?? PUMP_TOTAL_SUPPLY);
-      const largest = Array.isArray(largestRes?.value) ? largestRes.value : [];
-      if (supply > 0 && largest.length) {
-        // Skip the single biggest account when it dwarfs everything: on a
-        // bonding-curve launch that is the curve itself, not a holder.
-        const amounts = largest.map((entry) => Number(entry.uiAmount ?? 0));
-        const sorted = [...amounts].sort((a, b) => b - a);
-        const curveLike = sorted[0] > supply * 0.5 ? sorted[0] : 0;
-        const effectiveSupply = supply - curveLike;
-        const holders = curveLike ? sorted.slice(1) : sorted;
-        if (effectiveSupply > 0) {
-          const top10 = holders.slice(0, 10).reduce((total, amount) => total + amount, 0);
-          out.top10Pct = (top10 / effectiveSupply) * 100;
+      const latest = await this.client.public.getBlockNumber();
+      const from = event.blockNumber;
+      const to = from + CURVE_WINDOW_BLOCKS > latest ? latest : from + CURVE_WINDOW_BLOCKS;
+
+      const logs = [];
+      for (let start = from; start <= to; start += CURVE_CHUNK_BLOCKS) {
+        const end = start + CURVE_CHUNK_BLOCKS - 1n > to ? to : start + CURVE_CHUNK_BLOCKS - 1n;
+        const chunk = await this.client.public.getLogs({
+          address: ODYSSEY_FACTORIES,
+          event: odysseyTradedEvent,
+          args: { token: event.token },
+          fromBlock: start,
+          toBlock: end,
+        });
+        logs.push(...chunk);
+      }
+
+      let buys = 0;
+      let sells = 0;
+      let volumeWei = 0n;
+      let devBuyWei = 0n;
+      let lastPriceUsd = null;
+      const buyers = new Set();
+      for (const log of logs) {
+        const { trader, isBuy, tokenAmount, quoteAmount } = log.args;
+        if (isBuy) {
+          buys += 1;
+          buyers.add(String(trader).toLowerCase());
+          if (event.creator && String(trader).toLowerCase() === event.creator) {
+            devBuyWei += quoteAmount;
+          }
+        } else {
+          sells += 1;
+        }
+        volumeWei += quoteAmount;
+        if (tokenAmount > 0n && ethUsd) {
+          lastPriceUsd = (Number(quoteAmount) / Number(tokenAmount)) * ethUsd;
         }
       }
-      if (creator && supply > 0) {
-        const devRes = await this.rpc('getTokenAccountsByOwner', [
-          creator,
-          { mint },
-          { encoding: 'jsonParsed' },
-        ]);
-        const devAmount = (devRes?.value ?? []).reduce(
-          (total, account) =>
-            total +
-            Number(account?.account?.data?.parsed?.info?.tokenAmount?.uiAmount ?? 0),
-          0,
-        );
-        out.devHoldPct = (devAmount / supply) * 100;
-      }
-      // True holder count needs an indexer; Helius exposes DAS getTokenAccounts.
-      if (this.rpcUrl.includes('helius')) {
-        const das = await this.rpc('getTokenAccounts', {
-          mint,
-          limit: 1000,
-          options: { showZeroBalance: false },
-        }).catch(() => null);
-        const accounts = das?.token_accounts ?? das?.result?.token_accounts;
-        if (Array.isArray(accounts)) {
-          out.holdersCount = accounts.length >= 1000 ? 1000 : accounts.length;
-        }
+      const volumeEth = Number(volumeWei) / 1e18;
+      const devBuyEth = Number(devBuyWei) / 1e18;
+      return {
+        buys,
+        sells,
+        uniqueBuyers: buyers.size,
+        volumeEth,
+        volumeUsd: ethUsd ? volumeEth * ethUsd : null,
+        devBuyEth,
+        devBuyUsd: ethUsd ? devBuyEth * ethUsd : null,
+        lastPriceUsd,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Holder count + top-10 concentration from Blockscout. */
+  async holderStats(token, meta) {
+    const out = { holdersCount: null, top10Pct: null };
+    try {
+      const info = await fetchJson(`${BLOCKSCOUT_API}/tokens/${token}`);
+      const holders = Number(info?.holders ?? info?.holders_count);
+      if (Number.isFinite(holders)) out.holdersCount = holders;
+
+      const page = await fetchJson(`${BLOCKSCOUT_API}/tokens/${token}/holders`);
+      const items = Array.isArray(page?.items) ? page.items : [];
+      const supply = Number(meta.totalSupply);
+      if (items.length && supply > 0) {
+        const top10 = items
+          .map((item) => Number(item.value ?? 0))
+          .sort((a, b) => b - a)
+          .filter((value, index) => {
+            // The single dominant account on a fresh launch is the curve or
+            // the pool, not a holder; exclude it from concentration.
+            return !(index === 0 && value > supply * 0.5);
+          })
+          .slice(0, 10)
+          .reduce((total, value) => total + value, 0);
+        out.top10Pct = (top10 / supply) * 100;
       }
     } catch {
-      // Leave nulls; the rule engine treats missing fields as non-matching.
+      // Nulls; rules fail closed.
     }
     return out;
   }
 
-  async rpc(method, params) {
-    const response = await fetch(this.rpcUrl, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
-    if (!response.ok) throw new Error(`RPC ${method} ${response.status}`);
-    const body = await response.json();
-    if (body.error) throw new Error(`RPC ${method}: ${body.error.message}`);
-    return body.result;
+  /** Creator's current share of supply. */
+  async devHoldPct(token, creator, meta) {
+    try {
+      const balance = await this.client.public.readContract({
+        address: token,
+        abi: erc20Abi,
+        functionName: 'balanceOf',
+        args: [creator],
+      });
+      const supply = Number(meta.totalSupply);
+      return supply > 0 ? (Number(balance) / supply) * 100 : null;
+    } catch {
+      return null;
+    }
   }
-}
 
-function bondingProgress(coin) {
-  const virtualSol = Number(coin.virtual_sol_reserves);
-  if (!Number.isFinite(virtualSol) || virtualSol <= 0) return coin.complete ? 100 : null;
-  // pump.fun curves start at 30 virtual SOL and graduate around 115.
-  const progress = ((virtualSol / 1e9 - 30) / 85) * 100;
-  return Math.max(0, Math.min(100, progress));
-}
-
-function pickNumber(...values) {
-  for (const value of values) {
-    const numeric = Number(value);
-    if (Number.isFinite(numeric)) return numeric;
+  /** Pool depth: WETH side x2 (v3 pools are near-symmetric in value). */
+  async poolStats(pool, ethUsd) {
+    try {
+      const wethBalance = await this.client.public.readContract({
+        address: ADDRESSES.weth,
+        abi: erc20Abi,
+        functionName: 'balanceOf',
+        args: [pool],
+      });
+      const wethSide = Number(wethBalance) / 1e18;
+      return { liquidityUsd: ethUsd ? wethSide * 2 * ethUsd : null };
+    } catch {
+      return null;
+    }
   }
-  return null;
-}
-
-function sum(a, b) {
-  const left = Number(a);
-  const right = Number(b);
-  if (!Number.isFinite(left) && !Number.isFinite(right)) return null;
-  return (Number.isFinite(left) ? left : 0) + (Number.isFinite(right) ? right : 0);
 }
 
 async function fetchJson(url) {

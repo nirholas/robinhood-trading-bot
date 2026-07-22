@@ -4,8 +4,7 @@
  * 1. checkBuy(): gate every entry (rule-based or copy) against the config
  *    caps: per-order max, daily spend, open-position count, per-symbol
  *    cooldown. Applies in paper AND live mode so paper results are honest.
- *    In live mode the robinhood-mcp execution layer enforces its own caps on
- *    top (defense in depth).
+ *    Live mode adds the swap slippage bound on top.
  *
  * 2. monitorExits(): walk open positions each tick and close any that hit
  *    stop loss, take profit, trailing stop, or max hold time.
@@ -105,36 +104,37 @@ export class Risk {
   }
 
   /**
-   * One monitoring pass: refresh quotes for held symbols, ratchet trailing
-   * high-water marks, close positions whose exit tripped.
+   * One monitoring pass: reprice held tokens, ratchet trailing high-water
+   * marks, close positions whose exit tripped. `positions.symbol` holds the
+   * token address on Robinhood Chain.
    *
-   * @param {import('./robinhood/market.js').Market} market
-   * @param {import('./robinhood/trader.js').Trader} trader
+   * @param {import('./chain/market.js').Market} market
+   * @param {import('./chain/trader.js').Trader} trader
    */
   async monitorExits(market, trader) {
     const positions = this.store.listPositions();
     if (!positions.length) return;
     const exits = this.getConfig().exits ?? {};
-    const quotes = await market.quotes(positions.map((position) => position.symbol));
 
     for (const position of positions) {
-      const price = quotes.get(position.symbol)?.bid ?? quotes.get(position.symbol)?.mid;
+      const token = position.symbol;
+      const price = await market.priceUsd(token).catch(() => null);
       if (!price) continue;
 
-      market.recordTick(position.symbol, price);
+      market.recordTick(token, price);
       if (price > position.high_water) {
-        this.store.updateHighWater(position.symbol, price);
+        this.store.updateHighWater(token, price);
         position.high_water = price;
       }
 
       const decision = this.exitDecision(position, price, exits);
       if (!decision) continue;
 
-      this.bus.warn('risk.exit', `${position.symbol}: ${decision.reason}; selling ${position.qty}.`);
+      this.bus.warn('risk.exit', `${token}: ${decision.reason}; selling ${position.qty}.`);
       await trader.place({
-        symbol: position.symbol,
+        token,
         side: 'sell',
-        assetQty: position.qty,
+        qty: position.qty,
         source: 'exit',
         reason: decision.reason,
       });

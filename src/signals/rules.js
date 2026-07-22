@@ -9,7 +9,7 @@
  *       "ageMinutes":     { "lte": 30 },
  *       "liquidityUsd":   { "gte": 20000 },
  *       "devBuyPct":      { "lte": 5 },
- *       "symbol":         { "in": ["SOL-USD", "BONK-USD"] }
+ *       "launchpad":      { "eq": "odyssey" }
  *     },
  *     "action": { "side": "buy", "quoteUsd": 25 }
  *   }
@@ -115,8 +115,8 @@ export function validateRules(rules) {
       return;
     }
     if (!rule.name) problems.push(`rule[${index}]: missing "name"`);
-    if (!['new_pair', 'new_listing', 'copy'].includes(rule.source)) {
-      problems.push(`${label}: source must be new_pair, new_listing, or copy`);
+    if (!['new_pair', 'copy'].includes(rule.source)) {
+      problems.push(`${label}: source must be new_pair or copy`);
     }
     if (rule.when && typeof rule.when === 'object') {
       for (const [path, condition] of Object.entries(rule.when)) {

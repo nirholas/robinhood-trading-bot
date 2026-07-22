@@ -1,178 +1,254 @@
 /**
- * Solana wallet tracker: polls each tracked wallet's transaction history and
- * extracts swaps (what they bought or sold, how much, against what).
+ * Wallet tracker for Robinhood Chain: polls each tracked wallet's on-chain
+ * activity and extracts swaps (what they bought or sold, and for how much).
  *
- * Parsing is DEX-agnostic: instead of decoding every AMM's instruction
- * layout, it diffs the wallet's pre/post token balances and lamports in each
- * confirmed transaction. A swap is "token in, quote out" or the reverse, no
- * matter which router produced it. That means Jupiter, Raydium, pump.fun,
- * Orca, and whatever launches next week all parse the same way.
+ * Detection is venue-agnostic, by log diff rather than router decoding:
+ *
+ *   - ERC-20 Transfer logs where the wallet is sender or receiver, grouped
+ *     by transaction and reduced to per-token deltas. "Token in, WETH/USDG
+ *     out" is a buy on any DEX; the reverse is a sell.
+ *   - Router swaps paid in native ETH show no outgoing WETH transfer from
+ *     the wallet, so token-in transactions are resolved against the
+ *     transaction's own `value` and destination.
+ *   - Odyssey bonding-curve trades are read directly from the launchpad's
+ *     Traded event, which names the trader explicitly.
  */
 
-const WSOL_MINT = 'So11111111111111111111111111111111111111112';
-const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
-const USDT_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
-const QUOTE_MINTS = new Set([WSOL_MINT, USDC_MINT, USDT_MINT]);
-const RPC_TIMEOUT_MS = 15_000;
-const SIGNATURES_PER_POLL = 25;
-/** Wallet-poll transactions older than this are stale, not actionable. */
-const MAX_TRADE_AGE_MS = 15 * 60 * 1000;
+import { parseAbiItem } from 'viem';
+import { odysseyTradedEvent, ODYSSEY_ADDRESSES, erc20Abi } from 'hoodchain';
+import { QUOTE_TOKENS, ROUTER_ADDRESSES, ADDRESSES, shortAddr } from '../chain/hood.js';
+
+export { shortAddr as short };
+
+const transferEvent = parseAbiItem(
+  'event Transfer(address indexed from, address indexed to, uint256 value)',
+);
+
+/** ~100-130ms blocks: 9000 blocks is roughly the last 15-20 minutes. */
+const MAX_WINDOW_BLOCKS = 9_000n;
+
+const ODYSSEY_FACTORIES = [
+  ODYSSEY_ADDRESSES.bondingCurveFactory,
+  ODYSSEY_ADDRESSES.reflectionFactory,
+  ODYSSEY_ADDRESSES.instantFactory,
+];
 
 export class WalletTracker {
   /**
    * @param {import('../log.js').Bus} bus
    * @param {import('../store.js').Store} store
-   * @param {string} rpcUrl
+   * @param {import('hoodchain').HoodClient} client
+   * @param {import('../chain/market.js').Market} market
    * @param {(wallet: object, swap: object) => Promise<void>} onSwap
    */
-  constructor(bus, store, rpcUrl, onSwap) {
+  constructor(bus, store, client, market, onSwap) {
     this.bus = bus;
     this.store = store;
-    this.rpcUrl = rpcUrl;
+    this.client = client;
+    this.market = market;
     this.onSwap = onSwap;
   }
 
-  /** One pass over every enabled wallet. */
   async pollAll() {
     const wallets = this.store.listWallets(true);
+    if (!wallets.length) return;
+    const latest = await this.client.public.getBlockNumber();
     for (const wallet of wallets) {
       try {
-        await this.pollWallet(wallet);
+        await this.pollWallet(wallet, latest);
       } catch (error) {
-        this.bus.warn('copy.poll', `Poll failed for ${short(wallet.address)}: ${error.message}`);
+        this.bus.warn('copy.poll', `Poll failed for ${shortAddr(wallet.address)}: ${error.message}`);
       }
     }
   }
 
-  async pollWallet(wallet) {
-    const params = [
-      wallet.address,
-      { limit: SIGNATURES_PER_POLL, ...(wallet.last_sig ? { until: wallet.last_sig } : {}) },
-    ];
-    const signatures = (await this.rpc('getSignaturesForAddress', params)) ?? [];
-    if (!signatures.length) return;
+  async pollWallet(wallet, latest) {
+    const address = wallet.address.toLowerCase();
 
-    // Newest first from the RPC. Advance the cursor immediately so a crash
-    // mid-batch never replays trades, then process oldest to newest.
-    const newest = signatures[0].signature;
-
+    // First poll seeds the cursor: history is never replayed.
     if (!wallet.last_sig) {
-      // First poll for this wallet: seed the cursor only. Replaying history
-      // would mirror trades the wallet made before we started tracking it.
-      this.store.setWalletCursor(wallet.address, newest);
-      this.bus.info('copy.seed', `Tracking ${wallet.label || short(wallet.address)} from now on.`);
+      this.store.setWalletCursor(wallet.address, latest.toString());
+      this.bus.info('copy.seed', `Tracking ${wallet.label || shortAddr(address)} from block ${latest}.`);
       return;
     }
 
-    this.store.setWalletCursor(wallet.address, newest);
+    let from = BigInt(wallet.last_sig) + 1n;
+    if (latest - from > MAX_WINDOW_BLOCKS) from = latest - MAX_WINDOW_BLOCKS;
+    if (from > latest) return;
+    this.store.setWalletCursor(wallet.address, latest.toString());
 
-    const fresh = signatures
-      .filter((entry) => !entry.err)
-      .filter((entry) => !entry.blockTime || Date.now() - entry.blockTime * 1000 < MAX_TRADE_AGE_MS)
-      .reverse();
+    const [outgoing, incoming, curveLogs] = await Promise.all([
+      this.client.public.getLogs({ event: transferEvent, args: { from: wallet.address }, fromBlock: from, toBlock: latest }),
+      this.client.public.getLogs({ event: transferEvent, args: { to: wallet.address }, fromBlock: from, toBlock: latest }),
+      this.client.public.getLogs({
+        address: ODYSSEY_FACTORIES,
+        event: odysseyTradedEvent,
+        args: { trader: wallet.address },
+        fromBlock: from,
+        toBlock: latest,
+      }),
+    ]);
 
-    for (const entry of fresh) {
-      const tx = await this.rpc('getTransaction', [
-        entry.signature,
-        { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0, commitment: 'confirmed' },
-      ]).catch(() => null);
-      if (!tx) continue;
-      const swaps = parseWalletSwaps(tx, wallet.address);
-      for (const swap of swaps) {
-        await this.onSwap(wallet, { ...swap, signature: entry.signature, blockTime: entry.blockTime });
+    // Curve trades are explicit; hand them straight to the mirror.
+    const curveTxHashes = new Set();
+    for (const log of curveLogs) {
+      curveTxHashes.add(log.transactionHash);
+      const { isBuy, tokenAmount, quoteAmount } = log.args;
+      await this.emitSwap(wallet, {
+        token: String(log.args.token).toLowerCase(),
+        side: isBuy ? 'buy' : 'sell',
+        tokenDeltaRaw: isBuy ? tokenAmount : -tokenAmount,
+        quoteWethWei: isBuy ? -quoteAmount : quoteAmount,
+        quoteUsdgRaw: 0n,
+        txHash: log.transactionHash,
+        via: 'odyssey-curve',
+      });
+    }
+
+    // Everything else: group transfers by transaction, diff, classify.
+    const groups = groupTransfers([...outgoing, ...incoming], address);
+    for (const [txHash, deltas] of groups) {
+      if (curveTxHashes.has(txHash)) continue;
+      let txMeta = null;
+      if (needsTxLookup(deltas)) {
+        const tx = await this.client.public.getTransaction({ hash: txHash }).catch(() => null);
+        if (tx) txMeta = { to: tx.to ? tx.to.toLowerCase() : null, valueWei: tx.value };
+      }
+      for (const swap of classifySwaps(deltas, txMeta)) {
+        await this.emitSwap(wallet, { ...swap, txHash, via: 'transfer-diff' });
       }
     }
   }
 
-  async rpc(method, params) {
-    const response = await fetch(this.rpcUrl, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-      signal: AbortSignal.timeout(RPC_TIMEOUT_MS),
-    });
-    if (!response.ok) throw new Error(`RPC ${method} ${response.status}`);
-    const body = await response.json();
-    if (body.error) throw new Error(`RPC ${method}: ${body.error.message}`);
-    return body.result;
+  /** Convert raw deltas to UI units + USD and forward to the mirror. */
+  async emitSwap(wallet, swap) {
+    try {
+      const meta = await this.market.metadata(swap.token);
+      const qty = Math.abs(Number(swap.tokenDeltaRaw)) / 10 ** meta.decimals;
+      const ethUsd = await this.market.ethUsd().catch(() => null);
+      const wethUsd = ethUsd ? (Math.abs(Number(swap.quoteWethWei)) / 1e18) * ethUsd : null;
+      const usdgUsd = Math.abs(Number(swap.quoteUsdgRaw)) / 1e6;
+      const notionalUsd = usdgUsd > 0.000001 ? usdgUsd : wethUsd;
+
+      let fraction = null;
+      if (swap.side === 'sell') {
+        const balanceAfter = await this.client.public
+          .readContract({
+            address: swap.token,
+            abi: erc20Abi,
+            functionName: 'balanceOf',
+            args: [wallet.address],
+          })
+          .catch(() => null);
+        if (balanceAfter !== null) {
+          const sold = Math.abs(Number(swap.tokenDeltaRaw));
+          const before = Number(balanceAfter) + sold;
+          fraction = before > 0 ? Math.min(1, sold / before) : 1;
+        }
+      }
+
+      await this.onSwap(wallet, {
+        token: swap.token,
+        symbol: meta.symbol,
+        side: swap.side,
+        qty,
+        notionalUsd,
+        fractionSold: fraction,
+        txHash: swap.txHash,
+        via: swap.via,
+      });
+    } catch (error) {
+      this.bus.warn('copy.emit', `Swap handling failed (${shortAddr(swap.token)}): ${error.message}`);
+    }
   }
 }
 
 /**
- * Extract the wallet's swaps from a jsonParsed transaction by balance diff.
- * Pure function, unit-tested without a network.
- *
- * @returns {Array<{
- *   mint: string, side: 'buy'|'sell', tokenDelta: number,
- *   preTokenAmount: number, solDelta: number, usdcDelta: number,
- *   fractionSold: number|null
- * }>}
+ * Group Transfer logs into per-transaction, per-token deltas for the wallet.
+ * Pure function, unit-tested. Returns Map<txHash, Map<token, bigint>>.
  */
-export function parseWalletSwaps(tx, walletAddress) {
-  const meta = tx?.meta;
-  if (!meta || meta.err) return [];
+export function groupTransfers(logs, walletAddress) {
+  const wallet = walletAddress.toLowerCase();
+  const groups = new Map();
+  const seen = new Set();
+  for (const log of logs) {
+    const id = `${log.transactionHash}:${log.logIndex}`;
+    if (seen.has(id)) continue; // from- and to-queries can both return a self-transfer
+    seen.add(id);
 
-  // Lamport delta for the wallet itself (fees included; small enough not to
-  // distort classification).
-  const accountKeys = tx.transaction?.message?.accountKeys ?? [];
-  const walletIndex = accountKeys.findIndex(
-    (key) => (typeof key === 'string' ? key : key?.pubkey) === walletAddress,
-  );
-  let solDelta = 0;
-  if (walletIndex >= 0 && Array.isArray(meta.preBalances) && Array.isArray(meta.postBalances)) {
-    solDelta = (meta.postBalances[walletIndex] - meta.preBalances[walletIndex]) / 1e9;
-  }
+    const token = String(log.address).toLowerCase();
+    const from = String(log.args.from).toLowerCase();
+    const to = String(log.args.to).toLowerCase();
+    let delta = 0n;
+    if (from === wallet) delta -= log.args.value;
+    if (to === wallet) delta += log.args.value;
+    if (delta === 0n) continue;
 
-  // Per-mint token deltas owned by the wallet (wrapped SOL folds into SOL).
-  const deltas = new Map();
-  const preAmounts = new Map();
-  for (const balance of meta.preTokenBalances ?? []) {
-    if (balance.owner !== walletAddress) continue;
-    const amount = Number(balance.uiTokenAmount?.uiAmount ?? 0);
-    preAmounts.set(balance.mint, (preAmounts.get(balance.mint) ?? 0) + amount);
-    deltas.set(balance.mint, (deltas.get(balance.mint) ?? 0) - amount);
-  }
-  for (const balance of meta.postTokenBalances ?? []) {
-    if (balance.owner !== walletAddress) continue;
-    const amount = Number(balance.uiTokenAmount?.uiAmount ?? 0);
-    deltas.set(balance.mint, (deltas.get(balance.mint) ?? 0) + amount);
-  }
-
-  const wsolDelta = deltas.get(WSOL_MINT) ?? 0;
-  const usdcDelta = (deltas.get(USDC_MINT) ?? 0) + (deltas.get(USDT_MINT) ?? 0);
-  const effectiveSolDelta = solDelta + wsolDelta;
-
-  const swaps = [];
-  for (const [mint, delta] of deltas) {
-    if (QUOTE_MINTS.has(mint)) continue;
-    if (Math.abs(delta) < 1e-9) continue;
-
-    if (delta > 0 && (effectiveSolDelta < -1e-6 || usdcDelta < -1e-6)) {
-      swaps.push({
-        mint,
-        side: 'buy',
-        tokenDelta: delta,
-        preTokenAmount: preAmounts.get(mint) ?? 0,
-        solDelta: effectiveSolDelta,
-        usdcDelta,
-        fractionSold: null,
-      });
-    } else if (delta < 0 && (effectiveSolDelta > 1e-6 || usdcDelta > 1e-6)) {
-      const pre = preAmounts.get(mint) ?? 0;
-      swaps.push({
-        mint,
-        side: 'sell',
-        tokenDelta: delta,
-        preTokenAmount: pre,
-        solDelta: effectiveSolDelta,
-        usdcDelta,
-        fractionSold: pre > 0 ? Math.min(1, Math.abs(delta) / pre) : 1,
-      });
+    let group = groups.get(log.transactionHash);
+    if (!group) {
+      group = new Map();
+      groups.set(log.transactionHash, group);
     }
+    group.set(token, (group.get(token) ?? 0n) + delta);
   }
-  return swaps;
+  return groups;
 }
 
-export function short(address) {
-  return address.length > 12 ? `${address.slice(0, 4)}..${address.slice(-4)}` : address;
+/** A token-in group with no quote-out needs the tx's native value checked. */
+export function needsTxLookup(deltas) {
+  let tokenIn = false;
+  let quoteOut = false;
+  for (const [token, delta] of deltas) {
+    if (QUOTE_TOKENS.has(token)) {
+      if (delta < 0n) quoteOut = true;
+    } else if (delta > 0n) {
+      tokenIn = true;
+    }
+  }
+  return tokenIn && !quoteOut;
+}
+
+/**
+ * Classify one transaction's deltas into swaps. Pure function, unit-tested.
+ *
+ * @param {Map<string, bigint>} deltas token -> signed raw delta for the wallet
+ * @param {{to: string|null, valueWei: bigint}|null} txMeta for ETH-paid buys
+ */
+export function classifySwaps(deltas, txMeta = null) {
+  const weth = ADDRESSES.weth.toLowerCase();
+  const usdg = ADDRESSES.usdg.toLowerCase();
+  const wethDelta = deltas.get(weth) ?? 0n;
+  const usdgDelta = deltas.get(usdg) ?? 0n;
+
+  // ETH sent to a router with tokens coming back is a native-ETH buy.
+  const ethPaid =
+    txMeta && txMeta.valueWei > 0n && txMeta.to && ROUTER_ADDRESSES.has(txMeta.to)
+      ? txMeta.valueWei
+      : 0n;
+
+  const swaps = [];
+  for (const [token, delta] of deltas) {
+    if (QUOTE_TOKENS.has(token) || delta === 0n) continue;
+
+    if (delta > 0n && (wethDelta < 0n || usdgDelta < 0n || ethPaid > 0n)) {
+      swaps.push({
+        token,
+        side: 'buy',
+        tokenDeltaRaw: delta,
+        quoteWethWei: wethDelta < 0n ? wethDelta : -ethPaid,
+        quoteUsdgRaw: usdgDelta < 0n ? usdgDelta : 0n,
+      });
+    } else if (delta < 0n && (wethDelta > 0n || usdgDelta > 0n)) {
+      swaps.push({
+        token,
+        side: 'sell',
+        tokenDeltaRaw: delta,
+        quoteWethWei: wethDelta > 0n ? wethDelta : 0n,
+        quoteUsdgRaw: usdgDelta > 0n ? usdgDelta : 0n,
+      });
+    }
+    // Token in with no quote out and no router ETH: an airdrop or plain
+    // transfer, not a trade. Token out with nothing back: a send. Both skipped.
+  }
+  return swaps;
 }

@@ -80,11 +80,11 @@ async function route(bot, method, url, body) {
 
   switch (path) {
     case '/api/wallets': {
-      const address = String(body?.address ?? '').trim();
-      if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address)) {
-        throw badRequest('address must be a base58 Solana public key');
+      const address = String(body?.address ?? '').trim().toLowerCase();
+      if (!/^0x[0-9a-f]{40}$/.test(address)) {
+        throw badRequest('address must be a 0x EVM address (Robinhood Chain wallet)');
       }
-      bot.store.addWallet(address, String(body?.label ?? '').slice(0, 60));
+      bot.store.addWallet(address, String(body?.label ?? '').slice(0, 60), 'robinhood-chain');
       bot.bus.info('wallet.add', `Tracking wallet ${address}${body?.label ? ` (${body.label})` : ''}.`);
       return { ok: true, wallets: bot.store.listWallets() };
     }
@@ -109,23 +109,23 @@ async function route(bot, method, url, body) {
     }
     case '/api/trade': {
       // Manual trade from the dashboard; same risk gates as automated flow.
-      const symbol = String(body?.symbol ?? '').toUpperCase();
+      const token = String(body?.token ?? '').trim().toLowerCase();
       const side = body?.side === 'sell' ? 'sell' : 'buy';
-      if (!/^[A-Z0-9]{2,12}-USD$/.test(symbol)) throw badRequest('symbol must look like SOL-USD');
+      if (!/^0x[0-9a-f]{40}$/.test(token)) throw badRequest('token must be a 0x ERC-20 address on Robinhood Chain');
       if (side === 'buy') {
         const quoteUsd = Number(body?.quoteUsd);
         if (!Number.isFinite(quoteUsd) || quoteUsd <= 0) throw badRequest('quoteUsd required');
-        const gate = bot.risk.checkBuy(symbol, quoteUsd);
+        const gate = bot.risk.checkBuy(token, quoteUsd);
         if (!gate.ok) throw badRequest(`blocked: ${gate.reason}`);
-        return bot.trader.place({ symbol, side, quoteUsd, source: 'manual', reason: 'manual dashboard order' });
+        return bot.trader.place({ token, side, quoteUsd, source: 'manual', reason: 'manual dashboard order' });
       }
-      const position = bot.store.getPosition(symbol);
-      if (!position) throw badRequest(`no open position in ${symbol}`);
+      const position = bot.store.getPosition(token);
+      if (!position) throw badRequest('no open position in that token');
       const fraction = Math.min(1, Math.max(0.01, Number(body?.fraction ?? 1)));
       return bot.trader.place({
-        symbol,
+        token,
         side,
-        assetQty: position.qty * fraction,
+        qty: position.qty * fraction,
         source: 'manual',
         reason: `manual dashboard sell ${(fraction * 100).toFixed(0)}%`,
       });

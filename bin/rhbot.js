@@ -5,7 +5,7 @@
  *   rhbot start                       run the bot (web dashboard + all loops)
  *   rhbot status                      snapshot: mode, cash, positions, wallets
  *   rhbot wallets ls                  list tracked wallets
- *   rhbot wallets add <addr> [label]  track a Solana wallet
+ *   rhbot wallets add <addr> [label]  track a Robinhood Chain wallet (0x...)
  *   rhbot wallets rm <addr>           stop tracking
  *   rhbot rules ls                    list entry rules and enabled state
  *   rhbot rules enable <name>         enable a rule
@@ -13,7 +13,7 @@
  *   rhbot trades [n]                  recent trades
  *   rhbot signals [n]                 recent signals
  *   rhbot pause | resume              halt / resume all entries
- *   rhbot keygen                      generate a Robinhood API keypair
+ *   rhbot keygen                      generate a burner trading wallet (chain 4663)
  */
 
 import { loadDotEnv, loadConfig, saveConfig, dbPath, envSettings } from '../src/config.js';
@@ -56,10 +56,10 @@ switch (command) {
     const store = openStore();
     const [sub, address, ...labelParts] = args;
     if (sub === 'add' && address) {
-      if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address)) {
-        fail('address must be a base58 Solana public key');
+      if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
+        fail('address must be a 0x EVM address (Robinhood Chain wallet)');
       }
-      store.addWallet(address, labelParts.join(' '));
+      store.addWallet(address.toLowerCase(), labelParts.join(' '), 'robinhood-chain');
       console.log(`Tracking ${address}`);
     } else if (sub === 'rm' && address) {
       store.removeWallet(address);
@@ -132,18 +132,15 @@ switch (command) {
   }
 
   case 'keygen': {
-    // Robinhood wants an Ed25519 keypair; you register the public key at
-    // robinhood.com -> Account -> Crypto -> API, and keep the seed in .env.
-    const { generateKeyPairSync } = await import('node:crypto');
-    const { publicKey, privateKey } = generateKeyPairSync('ed25519');
-    const der = privateKey.export({ format: 'der', type: 'pkcs8' });
-    const seed = der.subarray(der.length - 32).toString('base64');
-    const spki = publicKey.export({ format: 'der', type: 'spki' });
-    const pub = spki.subarray(spki.length - 32).toString('base64');
-    console.log('Public key (register with Robinhood):');
-    console.log(`  ${pub}`);
-    console.log('Private key (put in .env as ROBINHOOD_CRYPTO_PRIVATE_KEY, never share):');
-    console.log(`  ${seed}`);
+    // A fresh burner wallet for Robinhood Chain (chain ID 4663). Fund it with
+    // ETH (bridge via jumper.exchange), wrap into WETH, and keep the key in .env.
+    const { generatePrivateKey, privateKeyToAccount } = await import('viem/accounts');
+    const key = generatePrivateKey();
+    const account = privateKeyToAccount(key);
+    console.log('Address (fund with ETH/WETH on Robinhood Chain 4663):');
+    console.log(`  ${account.address}`);
+    console.log('Private key (put in .env as ROBINHOOD_CHAIN_PRIVATE_KEY, never share):');
+    console.log(`  ${key}`);
     break;
   }
 
@@ -158,7 +155,7 @@ Usage:
   rhbot trades [n]                  recent trades
   rhbot signals [n]                 recent signals
   rhbot pause | resume              halt / resume entries
-  rhbot keygen                      generate a Robinhood API keypair
+  rhbot keygen                      generate a burner trading wallet (chain 4663)
 
 Config lives in data/config.json; environment in .env (see .env.example).`);
     if (command && command !== 'help' && command !== '--help') process.exitCode = 1;

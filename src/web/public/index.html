@@ -57,6 +57,7 @@
 <body>
 <header>
   <h1>robinhood-trading-bot</h1>
+  <span class="pill">chain <b>4663</b></span>
   <span class="pill" id="modePill">mode <b>...</b></span>
   <span class="pill">cash <b id="cash">...</b></span>
   <span class="pill">positions <b id="posValue">...</b></span>
@@ -82,9 +83,9 @@
       <thead><tr><th>Label</th><th>Address</th><th>On</th><th></th></tr></thead>
       <tbody id="wallets"></tbody>
     </table>
-    <div class="empty" id="walletsEmpty" hidden>No wallets tracked yet. Add a Solana address below; its swaps will be parsed and mirrored per your copy settings.</div>
+    <div class="empty" id="walletsEmpty" hidden>No wallets tracked yet. Add a 0x address below; its Robinhood Chain swaps (Uniswap and Odyssey curve) will be parsed and mirrored per your copy settings.</div>
     <form class="row" id="walletForm">
-      <input id="wAddr" placeholder="Solana address" aria-label="Wallet address" required>
+      <input id="wAddr" placeholder="0x wallet address" aria-label="Wallet address" required>
       <input id="wLabel" placeholder="Label (optional)" aria-label="Wallet label" style="max-width:140px">
       <button class="primary" type="submit">Track</button>
     </form>
@@ -94,7 +95,7 @@
   <section class="panel">
     <h2>Manual order</h2>
     <form class="row" id="tradeForm">
-      <input id="tSymbol" placeholder="SOL-USD" aria-label="Symbol" required style="max-width:110px">
+      <input id="tSymbol" placeholder="0x token address" aria-label="Token address" required style="min-width:200px;flex:2">
       <select id="tSide" aria-label="Side"><option value="buy">buy</option><option value="sell">sell</option></select>
       <input id="tAmount" type="number" min="1" step="any" placeholder="USD" aria-label="Amount in USD" style="max-width:90px">
       <button class="primary" type="submit">Place</button>
@@ -107,7 +108,7 @@
         <tbody id="trades"></tbody>
       </table>
     </div>
-    <div class="empty" id="tradesEmpty" hidden>No trades yet.</div>
+    <div class="empty" id="tradesEmpty" hidden>No trades yet. Rule matches, copy mirrors, and manual orders land here.</div>
   </section>
 
   <section class="panel wide">
@@ -163,10 +164,10 @@
     for (const p of s.positions) {
       const pnl = p.pnlPct == null ? '' : (p.pnlPct >= 0 ? '+' : '') + p.pnlPct.toFixed(1) + '%';
       const row = document.createElement('tr');
-      row.innerHTML = '<td>' + p.symbol + '</td><td>' + Number(p.qty).toPrecision(6) + '</td><td>' + usd(p.avg_cost) +
+      row.innerHTML = '<td><a href="' + p.explorer + '" target="_blank" rel="noopener" title="' + p.token + '">' + p.displaySymbol + '</a></td><td>' + Number(p.qty).toPrecision(6) + '</td><td>' + usd(p.avg_cost) +
         '</td><td>' + usd(p.price) + '</td><td>' + usd(p.valueUsd) +
         '</td><td class="' + (p.pnlPct >= 0 ? 'pos' : 'neg') + '">' + pnl + '</td><td class="dim">' + p.source + '</td>' +
-        '<td><button data-close="' + p.symbol + '" class="danger" aria-label="Close position">close</button></td>';
+        '<td><button data-close="' + p.token + '" class="danger" aria-label="Close position">close</button></td>';
       posBody.appendChild(row);
     }
     $('positionsEmpty').hidden = s.positions.length > 0;
@@ -176,7 +177,7 @@
     for (const w of s.wallets) {
       const row = document.createElement('tr');
       row.innerHTML = '<td>' + (w.label || '<span class="dim">unnamed</span>') + '</td>' +
-        '<td title="' + w.address + '">' + w.address.slice(0, 4) + '..' + w.address.slice(-4) + '</td>' +
+        '<td title="' + w.address + '">' + w.address.slice(0, 6) + '..' + w.address.slice(-4) + '</td>' +
         '<td><button data-toggle="' + w.address + '" data-on="' + w.enabled + '" aria-label="Toggle wallet">' + (w.enabled ? 'on' : 'off') + '</button></td>' +
         '<td><button data-rm="' + w.address + '" class="danger" aria-label="Remove wallet">rm</button></td>';
       wBody.appendChild(row);
@@ -191,7 +192,7 @@
     for (const t of trades) {
       const row = document.createElement('tr');
       row.innerHTML = '<td class="dim">' + time(t.ts) + '</td><td class="' + (t.side === 'buy' ? 'pos' : 'neg') + '">' + t.side +
-        '</td><td>' + t.symbol + '</td><td>' + usd(t.quote_usd) + '</td><td>' + usd(t.price) +
+        '</td><td title="' + t.symbol + '">' + (t.symbol && t.symbol.startsWith('0x') ? t.symbol.slice(0, 6) + '..' + t.symbol.slice(-4) : t.symbol) + '</td><td>' + usd(t.quote_usd) + '</td><td>' + usd(t.price) +
         '</td><td class="dim">' + t.source + '</td><td class="dim">' + t.status + '</td>';
       body.appendChild(row);
     }
@@ -250,7 +251,7 @@
       refreshStatus();
     }
     if (target.dataset.close) {
-      if (confirm('Close entire ' + target.dataset.close + ' position?')) {
+      if (confirm('Close entire position in ' + target.dataset.close.slice(0, 10) + '..?')) {
         await api('/api/trade', { symbol: target.dataset.close, side: 'sell', fraction: 1 }).catch((e) => alert(e.message));
         refreshStatus(); refreshTrades();
       }
@@ -262,7 +263,7 @@
     const msg = $('tradeMsg');
     const side = $('tSide').value;
     try {
-      const body = { symbol: $('tSymbol').value.trim().toUpperCase(), side };
+      const body = { token: $('tSymbol').value.trim().toLowerCase(), side };
       if (side === 'buy') body.quoteUsd = Number($('tAmount').value);
       else body.fraction = 1;
       const result = await api('/api/trade', body);
