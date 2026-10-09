@@ -173,3 +173,7 @@ Plain ES modules, no build step. `src/bot.js` is the orchestrator; every subsyst
 ## License
 
 Apache-2.0
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=nirholas/robinhood-trading-bot&type=Date)](https://www.star-history.com/#nirholas/robinhood-trading-bot&Date)
