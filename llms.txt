@@ -1,0 +1,28 @@
+# robinhood-trading-bot
+
+> Automated Robinhood Crypto trading bot: rule-based entries on new pair launches (holders, dev buy, liquidity, momentum) plus copy trading that mirrors tracked wallets. Web dashboard, CLI, optional Telegram. Paper mode by default.
+
+robinhood-trading-bot is an open-source repository by nirholas, part of the three.ws ecosystem.
+
+## Docs
+
+- [README](https://github.com/nirholas/robinhood-trading-bot/blob/HEAD/README.md): install, usage and reference
+- [Quick start](https://github.com/nirholas/robinhood-trading-bot/blob/HEAD/README.md#quick-start)
+- [Going live](https://github.com/nirholas/robinhood-trading-bot/blob/HEAD/README.md#going-live)
+- [How it works](https://github.com/nirholas/robinhood-trading-bot/blob/HEAD/README.md#how-it-works)
+- [CLI](https://github.com/nirholas/robinhood-trading-bot/blob/HEAD/README.md#cli)
+- [HTTP API](https://github.com/nirholas/robinhood-trading-bot/blob/HEAD/README.md#http-api)
+- [Telegram](https://github.com/nirholas/robinhood-trading-bot/blob/HEAD/README.md#telegram)
+- [Notes and limits](https://github.com/nirholas/robinhood-trading-bot/blob/HEAD/README.md#notes-and-limits)
+- [Development](https://github.com/nirholas/robinhood-trading-bot/blob/HEAD/README.md#development)
+- [AGENTS.md](https://github.com/nirholas/robinhood-trading-bot/blob/HEAD/AGENTS.md): guidance for coding agents
+- [Full text for LLMs](https://github.com/nirholas/robinhood-trading-bot/blob/HEAD/llms-full.txt): the README inlined
+
+## Project
+
+- [Source](https://github.com/nirholas/robinhood-trading-bot)
+- [Issues](https://github.com/nirholas/robinhood-trading-bot/issues)
+- [Discussions](https://github.com/nirholas/robinhood-trading-bot/discussions)
+- [Homepage](https://three.ws)
+- [three.ws](https://three.ws): the platform this is part of
+- [All repositories by nirholas](https://github.com/nirholas/nirholas#readme)
