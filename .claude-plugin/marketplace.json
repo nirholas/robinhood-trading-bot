@@ -1,0 +1,21 @@
+{
+  "name": "robinhood-trading-bot",
+  "owner": {
+    "name": "nirholas"
+  },
+  "description": "Run the rhbot Robinhood Chain trading bot in paper mode and manage its tracked wallets, entry rules and trades.",
+  "plugins": [
+    {
+      "name": "rhbot",
+      "source": "./plugins/rhbot",
+      "description": "Run the rhbot Robinhood Chain trading bot in paper mode and manage its tracked wallets, entry rules and trades.",
+      "category": "finance",
+      "tags": [
+        "robinhood-chain",
+        "trading-bot",
+        "copy-trading",
+        "paper-trading"
+      ]
+    }
+  ]
+}
