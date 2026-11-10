@@ -1,0 +1,17 @@
+{
+  "name": "rhbot",
+  "version": "0.2.0",
+  "description": "Run the rhbot Robinhood Chain trading bot in paper mode and manage its tracked wallets, entry rules and trades.",
+  "author": {
+    "name": "nirholas"
+  },
+  "repository": "https://github.com/nirholas/robinhood-trading-bot",
+  "homepage": "https://github.com/nirholas/robinhood-trading-bot",
+  "license": "Apache-2.0",
+  "keywords": [
+    "robinhood-chain",
+    "trading-bot",
+    "copy-trading",
+    "paper-trading"
+  ]
+}
